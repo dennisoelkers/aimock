@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import * as http from "node:http";
+import * as net from "node:net";
 import type { Fixture, HandlerDefaults } from "../types.js";
 import { createServer, type ServerInstance } from "../server.js";
 import { ollamaToCompletionRequest, handleOllama, handleOllamaGenerate } from "../ollama.js";
@@ -103,6 +104,43 @@ function postRaw(url: string, raw: string): Promise<{ status: number; body: stri
     req.on("error", reject);
     req.write(raw);
     req.end();
+  });
+}
+
+// Sends a raw GET with `Upgrade: h2c` + `Connection: Upgrade` headers, as
+// OkHttp (and thus langchain4j) speculatively does even for plain requests.
+// http.request() can't produce this from the client side, so we use a raw
+// socket and parse the response ourselves.
+function getWithH2cUpgradeHeaders(url: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const port = parsed.port ? Number(parsed.port) : 80;
+    const socket = net.connect(port, parsed.hostname, () => {
+      socket.write(
+        `GET ${parsed.pathname} HTTP/1.1\r\n` +
+          `Host: ${parsed.host}\r\n` +
+          `Upgrade: h2c\r\n` +
+          `Connection: Upgrade\r\n` +
+          `\r\n`,
+      );
+    });
+    let data = "";
+    socket.on("data", (chunk: Buffer) => {
+      data += chunk.toString();
+    });
+    socket.on("error", reject);
+    socket.on("close", () => {
+      const [head, ...rest] = data.split("\r\n\r\n");
+      const statusLine = head.split("\r\n")[0] ?? "";
+      const status = Number(statusLine.split(" ")[1] ?? 0);
+      // Body may be chunked; strip chunk-size lines for the assertions below.
+      const body = rest
+        .join("\r\n\r\n")
+        .split("\r\n")
+        .filter((line) => !/^[0-9a-f]+$/i.test(line.trim()))
+        .join("");
+      resolve({ status, body });
+    });
   });
 }
 
@@ -881,6 +919,21 @@ describe("GET /api/tags", () => {
     // Default models should include standard ones
     const names = body.models.map((m: { name: string }) => m.name);
     expect(names).toContain("gpt-4");
+  });
+
+  // Regression test: langchain4j's OkHttp-based client probes for HTTP/2
+  // cleartext support by sending `Upgrade: h2c` + `Connection: Upgrade` on
+  // its plain GET /api/tags request. Node's http module treats any
+  // `Connection: Upgrade` header as a protocol-upgrade request, so this must
+  // not be swallowed by the WebSocket-upgrade path and 404.
+  it("responds normally when the request carries h2c upgrade probe headers", async () => {
+    instance = await createServer(allFixtures);
+    const res = await getWithH2cUpgradeHeaders(`${instance.url}/api/tags`);
+
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body);
+    const names = body.models.map((m: { name: string }) => m.name);
+    expect(names).toContain("llama3");
   });
 });
 
