@@ -107,40 +107,63 @@ function postRaw(url: string, raw: string): Promise<{ status: number; body: stri
   });
 }
 
-// Sends a raw GET with `Upgrade: h2c` + `Connection: Upgrade` headers, as
+// Sends a raw request with `Upgrade: h2c` + `Connection: Upgrade` headers, as
 // OkHttp (and thus langchain4j) speculatively does even for plain requests.
 // http.request() can't produce this from the client side, so we use a raw
 // socket and parse the response ourselves.
-function getWithH2cUpgradeHeaders(url: string): Promise<{ status: number; body: string }> {
+function requestWithH2cUpgradeHeaders(
+  url: string,
+  method: string,
+  body?: string,
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const port = parsed.port ? Number(parsed.port) : 80;
     const socket = net.connect(port, parsed.hostname, () => {
+      const bodyHeaders = body
+        ? `Content-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n`
+        : "";
       socket.write(
-        `GET ${parsed.pathname} HTTP/1.1\r\n` +
+        `${method} ${parsed.pathname} HTTP/1.1\r\n` +
           `Host: ${parsed.host}\r\n` +
+          bodyHeaders +
           `Upgrade: h2c\r\n` +
           `Connection: Upgrade\r\n` +
-          `\r\n`,
+          `\r\n` +
+          (body ?? ""),
       );
     });
     let data = "";
+    // The server keeps the connection alive (we don't send a real
+    // `Connection: close`), so completion must be detected from the response
+    // framing itself rather than waiting for the socket to close.
     socket.on("data", (chunk: Buffer) => {
       data += chunk.toString();
-    });
-    socket.on("error", reject);
-    socket.on("close", () => {
-      const [head, ...rest] = data.split("\r\n\r\n");
+      const headerEnd = data.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+      const head = data.slice(0, headerEnd);
+      const rest = data.slice(headerEnd + 4);
+      const isChunked = /transfer-encoding:\s*chunked/i.test(head);
+      const contentLengthMatch = head.match(/content-length:\s*(\d+)/i);
+      const done = isChunked
+        ? rest.endsWith("0\r\n\r\n")
+        : contentLengthMatch
+          ? Buffer.byteLength(rest) >= Number(contentLengthMatch[1])
+          : false;
+      if (!done) return;
+
       const statusLine = head.split("\r\n")[0] ?? "";
       const status = Number(statusLine.split(" ")[1] ?? 0);
-      // Body may be chunked; strip chunk-size lines for the assertions below.
-      const body = rest
-        .join("\r\n\r\n")
-        .split("\r\n")
-        .filter((line) => !/^[0-9a-f]+$/i.test(line.trim()))
-        .join("");
-      resolve({ status, body });
+      const responseBody = isChunked
+        ? rest
+            .split("\r\n")
+            .filter((line) => !/^[0-9a-f]+$/i.test(line.trim()))
+            .join("")
+        : rest.slice(0, Number(contentLengthMatch![1]));
+      socket.destroy();
+      resolve({ status, body: responseBody });
     });
+    socket.on("error", reject);
   });
 }
 
@@ -928,12 +951,33 @@ describe("GET /api/tags", () => {
   // not be swallowed by the WebSocket-upgrade path and 404.
   it("responds normally when the request carries h2c upgrade probe headers", async () => {
     instance = await createServer(allFixtures);
-    const res = await getWithH2cUpgradeHeaders(`${instance.url}/api/tags`);
+    const res = await requestWithH2cUpgradeHeaders(`${instance.url}/api/tags`, "GET");
 
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
     const names = body.models.map((m: { name: string }) => m.name);
     expect(names).toContain("llama3");
+  });
+});
+
+describe("POST /api/chat (h2c upgrade probe)", () => {
+  // Regression test: the same h2c probe headers on a POST with a body used to
+  // reach the request handler with an empty body (Node detaches its parser
+  // from `req` once "upgrade" fires, so bytes buffered in `head` never became
+  // part of `req`'s stream), producing a "Malformed JSON body" error instead
+  // of the real validation error for the request that was actually sent.
+  it("still parses the JSON body and returns the real validation error", async () => {
+    instance = await createServer(allFixtures);
+    const res = await requestWithH2cUpgradeHeaders(
+      `${instance.url}/api/chat`,
+      "POST",
+      JSON.stringify({ model: "llama3.2" }),
+    );
+
+    expect(res.status).toBe(400);
+    const body = JSON.parse(res.body);
+    expect(body.error.message).toMatch(/messages/i);
+    expect(body.error.message).not.toMatch(/Malformed JSON/i);
   });
 });
 
