@@ -3145,6 +3145,25 @@ export async function createServerWithResolvedAuth(
     socket: import("node:net").Socket,
     head: Buffer,
   ): Promise<void> {
+    // Node emits "upgrade" (never "request") for ANY request carrying a
+    // `Connection: Upgrade` header, regardless of what's being upgraded to.
+    // Some HTTP clients (e.g. OkHttp, used by langchain4j) speculatively send
+    // `Upgrade: h2c` + `Connection: Upgrade` on plain requests to probe for
+    // HTTP/2 cleartext support. Only actual WebSocket upgrades belong on this
+    // path — anything else must fall through to the normal HTTP pipeline so
+    // routes like `/api/tags` still work.
+    if ((req.headers.upgrade ?? "").toLowerCase() !== "websocket") {
+      if (head.length > 0) socket.unshift(head);
+      const res = new http.ServerResponse(req);
+      res.assignSocket(socket);
+      res.on("finish", () => {
+        res.detachSocket(socket);
+        socket.end();
+      });
+      await handleHttpRequest(req, res);
+      return;
+    }
+
     const parsedUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     let pathname = parsedUrl.pathname;
 
